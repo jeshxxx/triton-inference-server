@@ -25,6 +25,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "src/backends/backend/examples/backend_input_collector.h"
+#include "src/backends/backend/examples/backend_model.h"
 #include "src/backends/backend/examples/backend_model_instance.h"
 #include "src/backends/backend/examples/backend_output_responder.h"
 #include "src/backends/backend/examples/backend_utils.h"
@@ -935,10 +936,11 @@ class ModelState {
   static TRITONSERVER_Error* Create(
       TRITONBACKEND_Model* triton_model, ModelState** state);
 
-  const std::string& Name() { return name_; }
-  TRITONBACKEND_Model* TritonModel() { return triton_model_; }
-  ::BackendConfig* BackendConfig() { return backend_config_; }
-  ni::TritonJson::Value& ModelConfig() { return model_config_; }
+  const std::string& Name() const { return backend_model_->Name(); }
+  uint64_t Version() const { return backend_model_->Version(); }
+  TRITONBACKEND_Model* TritonModel() { return backend_model_->TritonModel(); }
+  ::BackendConfig* BackendConfig() const { return backend_config_; }
+  TritonJson::Value& ModelConfig() { return backend_model_->ModelConfig(); }
   const std::unordered_map<std::string, std::string>& ModelPaths() const
   {
     return model_paths_;
@@ -947,8 +949,8 @@ class ModelState {
 
  private:
   ModelState(
-      TRITONBACKEND_Model* triton_model, const std::string& name,
-      ::BackendConfig* backend_config, ni::TritonJson::Value&& model_config,
+      std::unique_ptr<nib::BackendModel> backend_model,
+      ::BackendConfig* backend_config,
       std::unordered_map<std::string, std::string>&& model_paths,
       const bool is_graphdef);
 
@@ -958,10 +960,8 @@ class ModelState {
   // Validate that model configuration is supported by this backend.
   TRITONSERVER_Error* ValidateModelConfig();
 
-  TRITONBACKEND_Model* triton_model_;
-  const std::string name_;
+  std::unique_ptr<nib::BackendModel> backend_model_;
   ::BackendConfig* backend_config_;
-  ni::TritonJson::Value model_config_;
   const std::unordered_map<std::string, std::string> model_paths_;
   const bool is_graphdef_;
 };
@@ -969,6 +969,14 @@ class ModelState {
 TRITONSERVER_Error*
 ModelState::Create(TRITONBACKEND_Model* triton_model, ModelState** state)
 {
+  // Use BackendModel to hold common backend state.
+  std::unique_ptr<nib::BackendModel> backend_model;
+  {
+    nib::BackendModel* lbm;
+    RETURN_IF_ERROR(nib::BackendModel::Create(triton_model, &lbm));
+    backend_model.reset(lbm);
+  }
+
   // Obtain backend config
   TRITONBACKEND_Backend* backend;
   RETURN_IF_ERROR(TRITONBACKEND_ModelBackend(triton_model, &backend));
@@ -980,28 +988,9 @@ ModelState::Create(TRITONBACKEND_Model* triton_model, ModelState** state)
   RETURN_IF_ERROR(TRITONBACKEND_ModelConfig(
       triton_model, 1 /* config_version */, &config_message));
 
-  // We can get the model configuration as a json string from
-  // config_message, parse it with our favorite json parser to create
-  // DOM that we can access when we need to example the
-  // configuration. We use TritonJson, which is a wrapper that returns
-  // nice errors (currently the underlying implementation is
-  // rapidjson... but others could be added). You can use any json
-  // parser you prefer.
-  const char* buffer;
-  size_t byte_size;
-  RETURN_IF_ERROR(
-      TRITONSERVER_MessageSerializeToJson(config_message, &buffer, &byte_size));
-
-  ni::TritonJson::Value model_config;
-  TRITONSERVER_Error* err = model_config.Parse(buffer, byte_size);
-  RETURN_IF_ERROR(TRITONSERVER_MessageDelete(config_message));
-  RETURN_IF_ERROR(err);
-
-  const char* name;
-  RETURN_IF_ERROR(TRITONBACKEND_ModelName(triton_model, &name));
-
   std::string platform;
-  RETURN_IF_ERROR(model_config.MemberAsString("platform", &platform));
+  RETURN_IF_ERROR(
+      backend_model->ModelConfig().MemberAsString("platform", &platform));
   bool is_graphdef;
   if (platform == "tensorflow_graphdef") {
     is_graphdef = true;
@@ -1012,29 +1001,18 @@ ModelState::Create(TRITONBACKEND_Model* triton_model, ModelState** state)
         TRITONSERVER_ERROR_INVALID_ARG, (std::string("platform ") + platform +
                                          " not supported for TensorFlow "
                                          "model '" +
-                                         name + "'")
+                                         backend_model->Name() + "'")
                                             .c_str());
   }
 
-  const char* path = nullptr;
-  TRITONBACKEND_ModelArtifactType artifact_type;
-  RETURN_IF_ERROR(
-      TRITONBACKEND_ModelRepository(triton_model, &artifact_type, &path));
-  if (artifact_type != TRITONBACKEND_ARTIFACT_FILESYSTEM) {
-    return TRITONSERVER_ErrorNew(
-        TRITONSERVER_ERROR_UNSUPPORTED,
-        (std::string("unsupported artifact type for model '") + name + "'")
-            .c_str());
-  }
-  uint64_t version;
-  RETURN_IF_ERROR(TRITONBACKEND_ModelVersion(triton_model, &version));
   std::unordered_map<std::string, std::string> model_paths;
-  RETURN_IF_ERROR(
-      nib::ModelPaths(path, version, is_graphdef, !is_graphdef, &model_paths));
+  RETURN_IF_ERROR(nib::ModelPaths(
+      backend_model->RepositoryPath(), backend_model->Version(), is_graphdef,
+      !is_graphdef, &model_paths));
 
   std::unique_ptr<ModelState> local_state(new ModelState(
-      triton_model, name, backend_config, std::move(model_config),
-      std::move(model_paths), is_graphdef));
+      std::move(backend_model), backend_config, std::move(model_paths),
+      is_graphdef));
 
   // Check whether autocompletion is requested
   bool auto_complete_config = false;
@@ -1057,12 +1035,11 @@ ModelState::Create(TRITONBACKEND_Model* triton_model, ModelState** state)
 }
 
 ModelState::ModelState(
-    TRITONBACKEND_Model* triton_model, const std::string& name,
-    ::BackendConfig* backend_config, ni::TritonJson::Value&& model_config,
-    std::unordered_map<std::string, std::string>&& model_paths,
-    const bool is_graphdef)
-    : triton_model_(triton_model), name_(name), backend_config_(backend_config),
-      model_config_(std::move(model_config)),
+      std::unique_ptr<nib::BackendModel> backend_model,
+      ::BackendConfig* backend_config,
+      std::unordered_map<std::string, std::string>&& model_paths,
+      const bool is_graphdef)
+    : backend_model_(std::move(backend_model)), backend_config_(backend_config),
       model_paths_(std::move(model_paths)), is_graphdef_(is_graphdef)
 {
 }
@@ -1362,8 +1339,6 @@ ModelInstanceState::Create(
       model_state, triton_model_instance, instance_name, gpu_device, mbs,
       pinned_input, pinned_output));
   auto instance = lstate.get();
-
-  RETURN_IF_ERROR(instance->CreateCudaStream());
 
   TRTISTF_TFTRTConfig* tftrt_config_ptr = nullptr;
   TRTISTF_TFTRTConfig tftrt_config;

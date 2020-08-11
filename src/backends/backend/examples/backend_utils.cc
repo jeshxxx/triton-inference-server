@@ -643,4 +643,44 @@ ModelPaths(
   return nullptr;  // success
 }
 
+TRITONSERVER_Error*
+CreateCudaStream(
+    const int device_id, const int cuda_stream_priority, cudaStream_t* stream)
+{
+  *stream = nullptr;
+
+#ifdef TRITON_ENABLE_GPU
+  // Make sure that correct device is set before creating stream and
+  // then restore the device to what was set by the caller.
+  int current_device;
+  auto cuerr = cudaGetDevice(&current_device);
+  bool overridden = false;
+  if (cuerr == cudaSuccess) {
+    overridden = (current_device != device_id);
+    if (overridden) {
+      cuerr = cudaSetDevice(device_id);
+    }
+  }
+
+  if (cuerr == cudaSuccess) {
+    cuerr = cudaStreamCreateWithPriority(
+        stream, cudaStreamDefault, cuda_stream_priority);
+  }
+
+  if (overridden) {
+    cudaSetDevice(current_device);
+  }
+
+  if (cuerr != cudaSuccess) {
+    *stream = nullptr;
+    return TRITONSERVER_ErrorNew(
+        TRITONSERVER_ERROR_INTERNAL,
+        (std::string("unable to create stream: ") + cudaGetErrorString(cuerr))
+            .c_str());
+  }
+#endif  // TRITON_ENABLE_GPU
+
+  return nullptr;  // success
+}
+
 }}}  // namespace nvidia::inferenceserver::backend
