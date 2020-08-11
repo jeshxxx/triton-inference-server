@@ -2295,12 +2295,6 @@ TRITONBACKEND_ModelInstanceExecute(
   // this function. If something does go wrong in processing a
   // particular request then we send an error response just for the
   // specific request.
-
-  // Note that access to 'requests' will be invalidated once
-  // TRITONBACKEND_ModelInstanceExecute returns. If requests need to be
-  // referred after TRITONBACKEND_ModelInstanceExecute returns, i.e. in
-  // non-blocking model, the request array must be copied to a instance
-  // owned buffer.
   instance_state->ProcessRequests(requests, request_count);
 
   return nullptr;  // success
